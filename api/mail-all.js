@@ -1,4 +1,4 @@
-const Imap = require('node-imap');
+const { ImapFlow } = require('imapflow');
 const simpleParser = require("mailparser").simpleParser;
 
 async function get_access_token(refresh_token, client_id) {
@@ -27,11 +27,6 @@ async function get_access_token(refresh_token, client_id) {
     } catch (parseError) {
         throw new Error(`Failed to parse JSON: ${parseError.message}, response: ${responseText}`);
     }
-}
-
-const generateAuthString = (user, accessToken) => {
-    const authString = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
-    return Buffer.from(authString).toString('base64');
 }
 
 async function graph_api(refresh_token, client_id) {
@@ -160,10 +155,6 @@ module.exports = async (req, res) => {
 
             console.log("是graph_api");
 
-            if (mailbox != "INBOX" && mailbox != "Junk") {
-                mailbox = "inbox";
-            }
-
             if (mailbox == 'INBOX') {
                 mailbox = 'inbox';
             }
@@ -179,77 +170,61 @@ module.exports = async (req, res) => {
             return
         }
 
+        // ===== IMAP 路径：imapflow 替换废弃的 node-imap =====
+        // node-imap(0.9.x) 见到服务器 CAPABILITY 里的 LOGINDISABLED 就直接放弃认证，
+        // 而微软在禁用基础认证后，预认证阶段必然广播 LOGINDISABLED（即使 XOAUTH2 可用），
+        // 导致固定报错 "Logging in is disabled on this server"。
+        // imapflow 支持 auth.accessToken 的 XOAUTH2，不受 LOGINDISABLED 影响。
         const access_token = await get_access_token(refresh_token, client_id);
-        const authString = generateAuthString(email, access_token);
 
-        const imap = new Imap({
-            user: email,
-            xoauth2: authString,
+        const client = new ImapFlow({
             host: 'outlook.office365.com',
             port: 993,
-            tls: true,
-            tlsOptions: {
-                rejectUnauthorized: false
-            }
+            secure: true,
+            auth: {
+                user: email,
+                accessToken: access_token
+            },
+            logger: false,
+            greetingTimeout: 10000,
+            socketTimeout: 60000
         });
+
+        await client.connect();
 
         const emailList = [];
-        imap.once("ready", async () => {
-            try {
-                // 动态打开指定的邮箱（如 INBOX 或 Junk）
-                await new Promise((resolve, reject) => {
-                    imap.openBox(mailbox, true, (err, box) => {
-                        if (err) return reject(err);
-                        resolve(box);
-                    });
-                });
-
-                const results = await new Promise((resolve, reject) => {
-                    imap.search(["ALL"], (err, results) => {
-                        if (err) return reject(err);
-                        resolve(results);
-                    });
-                });
-
-                const f = imap.fetch(results, { bodies: "" });
-
-                f.on("message", (msg, seqno) => {
-                    msg.on("body", (stream, info) => {
-                        simpleParser(stream, (err, mail) => {
-                            if (err) throw err;
-                            const data = {
-                                send: mail.from.text,
-                                subject: mail.subject,
-                                text: mail.text,
-                                html: mail.html,
-                                date: mail.date,
-                            };
-
-                            emailList.push(data);
+        const lock = await client.getMailboxLock(mailbox);
+        try {
+            // 空文件夹直接返回空数组：对 0 封邮件发 FETCH 1:* 会被服务器拒（Command failed）
+            const exists = client.mailbox && client.mailbox.exists;
+            if (exists > 0) {
+                for await (const msg of client.fetch({ all: true }, { source: true })) {
+                    try {
+                        const mail = await simpleParser(msg.source);
+                        emailList.push({
+                            send: mail.from && mail.from.text,
+                            subject: mail.subject,
+                            text: mail.text,
+                            html: mail.html,
+                            date: mail.date,
                         });
-                    });
-                });
-
-                f.once("end", () => {
-                    imap.end();
-                });
-            } catch (err) {
-                imap.end();
-                res.status(500).json({ error: err.message });
+                    } catch (parseErr) {
+                        console.error('message parse error, skipped:', parseErr.message);
+                    }
+                }
             }
-        });
+        } finally {
+            lock.release();
+        }
 
-        imap.once('error', (err) => {
-            console.error('IMAP error:', err);
-            res.status(500).json({ error: err.message });
-        });
+        try {
+            await client.logout();
+        } catch (e) {
+            client.close();
+        }
 
-        imap.once('end', () => {
-            res.status(200).json(emailList);
-            console.log('IMAP connection ended');
-        });
-
-        imap.connect();
+        console.log('IMAP fetch ended, messages:', emailList.length);
+        res.status(200).json(emailList);
 
     } catch (error) {
         console.error('Error:', error);
