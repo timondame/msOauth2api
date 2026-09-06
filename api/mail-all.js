@@ -147,7 +147,14 @@ module.exports = async (req, res) => {
     try {
 
         console.log("判断是否graph_api");
-        const graph_api_result = await graph_api(refresh_token, client_id)
+        let graph_api_result;
+        try {
+            graph_api_result = await graph_api(refresh_token, client_id)
+        } catch (graphError) {
+            // Graph 无权限(如 Thunderbird client_id)时不要 500，落回 IMAP 兜底
+            console.log("graph_api 失败，转 IMAP 兜底:", graphError.message);
+            graph_api_result = { status: false };
+        }
 
         if (graph_api_result.status) {
 
